@@ -1,0 +1,29 @@
+# Python Backend Dependencies
+
+# Web Framework
+flask==3.0.0
+flask-cors==4.0.0
+flask-socketio==5.3.5
+
+# WebSocket
+python-socketio==5.10.0
+python-engineio==4.8.0
+
+# MQTT
+paho-mqtt==1.6.1
+
+# Computer Vision (for camera stream processing)
+opencv-python==4.8.1.78
+numpy==1.24.3
+
+# Deep Learning - YOLO Fire Detection
+torch==2.1.0
+torchvision==0.16.0
+# YOLOv5 (compatible with yolov5s_best.pt model)
+yolov5==7.0.13
+
+# HTTP Requests
+requests==2.31.0
+
+# Utilities
+python-dotenv==1.0.0

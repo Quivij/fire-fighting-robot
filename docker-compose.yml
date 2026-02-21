@@ -1,0 +1,34 @@
+services:
+  # MQTT Broker (Mosquitto)
+  mosquitto:
+    image: eclipse-mosquitto:latest
+    container_name: fire-robot-mosquitto
+    restart: unless-stopped
+    ports:
+      - "1883:1883" # MQTT port
+      # - "9001:9001"  # WebSocket port (disabled - port conflict)
+    volumes:
+      - ./mqtt-docker/config:/mosquitto/config
+      - ./mqtt-docker/data:/mosquitto/data
+      - ./mqtt-docker/logs:/mosquitto/log
+    networks:
+      - fire-robot-network
+
+  # Backend (Python Flask) - Optional: Chạy backend cùng stack
+  # backend:
+  #   build: ./backend
+  #   container_name: fire-robot-backend
+  #   restart: unless-stopped
+  #   ports:
+  #     - "5000:5000"
+  #   environment:
+  #     - MQTT_BROKER=mosquitto
+  #     - MQTT_PORT=1883
+  #   depends_on:
+  #     - mosquitto
+  #   networks:
+  #     - fire-robot-network
+
+networks:
+  fire-robot-network:
+    driver: bridge
