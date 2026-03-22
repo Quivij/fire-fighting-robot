@@ -32,19 +32,14 @@ class FireDetector:
     def __init__(
         self,
         model_path=None,
-        confidence_threshold=0.5,
+        confidence_threshold=0.6,
         enable_motion_check=True,
         motion_history_size=5,
     ):
         """
         Initialize Fire Detector
-
-        Args:
-            model_path: Path to YOLO model (if None, use color-based detection)
-            confidence_threshold: Minimum confidence for detection (0.0-1.0)
-            enable_motion_check: Enable motion/flicker detection (default True)
-            motion_history_size: Number of frames to analyze for motion (default 5)
         """
+
         self.model_path = model_path
         self.confidence_threshold = confidence_threshold
         self.enable_motion_check = enable_motion_check
@@ -52,23 +47,25 @@ class FireDetector:
 
         # Detection state
         self.fire_detected = False
-        self.dynamic_fire_detected = False  # Real flickering fire
-        self.static_fire_detected = False  # Static image with fire colors
+        self.dynamic_fire_detected = False
+        self.static_fire_detected = False
         self.last_detection_time = 0
         self.detection_count = 0
 
-        # Motion/Flicker detection settings
+        # Motion settings
         self.motion_history_size = motion_history_size
-        self.motion_history = deque(maxlen=motion_history_size)  # Store motion scores
-        self.prev_frames = deque(maxlen=3)  # Store last 3 frames for comparison
+        self.motion_history = deque(maxlen=motion_history_size)
+        self.prev_frames = deque(maxlen=3)
+
+        # ✅ THÊM DÒNG NÀY (FIX LỖI)
+        self.motion_pixel_threshold = 25
 
         # Tunable thresholds
-        self.motion_pixel_threshold = 15  # Pixel intensity change threshold
-        self.min_motion_pixels_ratio = 0.05  # 5% of fire region must change
-        self.min_motion_score = 0.4  # Minimum average motion score (0-1)
-        self.min_turbulence_variance = 50  # Variance in motion across frames
+        self.min_motion_pixels_ratio = 0.08
+        self.min_motion_score = 0.5
+        self.min_turbulence_variance = 30   # ✅ giữ 1 dòng thôi
 
-        # YOLO model (will load if model_path provided)
+        # YOLO model
         self.model = None
 
         if model_path:
@@ -81,29 +78,16 @@ class FireDetector:
                 f"[FireDetector] Motion detection ENABLED "
                 f"(history={motion_history_size}, threshold={self.motion_pixel_threshold})"
             )
-
     def _load_yolo_model(self):
-        """Load YOLO model from file"""
         try:
-            # Try YOLOv5 first (for yolov5s_best.pt models)
-            import torch
+            from ultralytics import YOLO
 
-            self.model = torch.hub.load(
-                "ultralytics/yolov5", "custom", path=self.model_path, force_reload=False
-            )
-            self.model.conf = self.confidence_threshold
-            logger.info(f"[FireDetector] YOLOv5 model loaded: {self.model_path}")
+            self.model = YOLO(self.model_path)
+            logger.info(f"[FireDetector] YOLOv8 model loaded: {self.model_path}")
 
-        except ImportError as e:
-            logger.warning(f"[FireDetector] PyTorch/YOLOv5 not installed: {e}")
-            logger.warning("[FireDetector] Install: pip install torch yolov5")
-            logger.warning("[FireDetector] Falling back to color-based detection")
-            self.model = None
         except Exception as e:
-            logger.error(f"[FireDetector] Failed to load YOLO model: {e}")
-            logger.warning("[FireDetector] Falling back to color-based detection")
+            logger.error(f"[FireDetector] Failed to load YOLOv8 model: {e}")
             self.model = None
-
     def detect_fire(self, frame):
         """
         Detect fire in frame
@@ -124,192 +108,95 @@ class FireDetector:
             return self._detect_yolo(frame)
         else:
             return self._detect_color_based(frame)
-
     def _detect_yolo(self, frame):
-        """
-        Detect fire using YOLO model + motion analysis
-
-        Steps:
-        0. Preprocess frame (fix overexposure)
-        1. Run YOLO inference
-        2. For each detection, analyze motion in bounding box region
-        3. Classify as DYNAMIC (real fire) or STATIC (image)
-
-        Args:
-            frame: BGR image
-
-        Returns:
-            tuple: (processed_frame, fire_detected, detections)
-        """
         try:
-            # === STEP 0: Preprocess frame ===
             frame_processed = self._preprocess_frame(frame)
 
-            # Store for motion analysis
             gray = cv2.cvtColor(frame_processed, cv2.COLOR_BGR2GRAY)
             self.prev_frames.append(gray)
 
-            # === STEP 1: Run YOLO inference ===
-            results = self.model(frame_processed)
+            results = self.model(frame_processed, conf=self.confidence_threshold)
 
             detections = []
             dynamic_fire_detected = False
-            static_fire_detected = False
             processed_frame = frame_processed.copy()
 
-            # === STEP 2: Process each detection ===
-            # YOLOv5 returns a single result object, not a list
-            if len(results.xyxy) > 0 and len(results.xyxy[0]) > 0:
-                # Get detections from first image (we only process 1 frame at a time)
-                preds = results.xyxy[0].cpu().numpy()  # [x1, y1, x2, y2, conf, class]
+            if len(results) > 0:
+                result = results[0]
 
-                logger.info(f"[YOLO] Found {len(preds)} detection(s)")
+                if result.boxes is not None:
+                    boxes = result.boxes.xyxy.cpu().numpy()
+                    confidences = result.boxes.conf.cpu().numpy()
+                    class_ids = result.boxes.cls.cpu().numpy()
 
-                for pred in preds:
-                    # Get box coordinates and class info
-                    # pred format: [x1, y1, x2, y2, confidence, class_id]
-                    x1, y1, x2, y2, confidence, class_id = pred
-                    class_id = int(class_id)
-                    class_name = results.names[class_id]
+                    for i in range(len(boxes)):
+                        x1, y1, x2, y2 = boxes[i]
+                        confidence = confidences[i]
+                        class_id = int(class_ids[i])
+                        class_name = self.model.names[class_id].lower()
 
-                    # DEBUG: Log all detections to see what YOLO is detecting
-                    logger.info(
-                        f"[YOLO DEBUG] Detected: class_id={class_id}, "
-                        f"class_name='{class_name}', confidence={confidence:.2f}"
-                    )
+                        # ✅ FIX 1: bỏ no_fire
+                        # if class_name == "no_fire":
+                        #     continue
 
-                    # Check if fire/flame/smoke class
-                    if class_name.lower() not in ["fire", "flame", "smoke"]:
-                        logger.warning(
-                            f"[YOLO] Skipping non-fire class: '{class_name}' "
-                            f"(not in ['fire', 'flame', 'smoke'])"
-                        )
-                        continue
+                        # # ✅ FIX 2: chỉ lấy fire
+                        # if class_name != "fire":
+                        #     continue
+                        # chỉ lấy class fire và confidence đủ cao
+                        if class_name != "fire" or confidence < self.confidence_threshold:
+                            continue
 
-                    # Create mask for this detection region
-                    detection_mask = np.zeros(gray.shape, dtype=np.uint8)
-                    detection_mask[int(y1) : int(y2), int(x1) : int(x2)] = 255
+                        # === MOTION CHECK ===
+                        detection_mask = np.zeros(gray.shape, dtype=np.uint8)
+                        detection_mask[int(y1):int(y2), int(x1):int(x2)] = 255
 
-                    # === STEP 3: Motion analysis ===
-                    motion_info = {"status": "motion_check_disabled"}
-                    if self.enable_motion_check:
-                        motion_info = self._analyze_motion_in_region(detection_mask)
+                        motion_info = {"status": "disabled"}
+                        if self.enable_motion_check:
+                            motion_info = self._analyze_motion_in_region(detection_mask)
 
-                    # Classify as dynamic or static
-                    is_dynamic = True  # Default
-                    if self.enable_motion_check:
-                        is_dynamic = motion_info.get(
-                            "has_motion", False
-                        ) or motion_info.get("has_turbulence", False)
+                        is_dynamic = motion_info.get("has_motion", False) or \
+                                    motion_info.get("has_turbulence", False)
 
-                    if is_dynamic:
-                        # === DYNAMIC FIRE (Real Fire) ===
-                        dynamic_fire_detected = True
+                        if is_dynamic:
+                            dynamic_fire_detected = True
+                            color = (0, 0, 255)
+                            label = f"🔥 FIRE {confidence:.2f}"
+                        else:
+                            color = (128, 128, 128)
+                            label = f"STATIC FIRE {confidence:.2f}"
 
-                        # Draw RED bounding box
+                        # DRAW BOX
                         cv2.rectangle(
                             processed_frame,
                             (int(x1), int(y1)),
                             (int(x2), int(y2)),
-                            (0, 0, 255),  # Red
-                            3,
+                            color,
+                            2
                         )
 
-                        # Draw label with confidence and motion
-                        label_lines = [
-                            f"{class_name.upper()} {confidence:.2f}",
-                            f"Motion: {motion_info.get('motion_ratio', 0) * 100:.1f}%",
-                            f"Score: {motion_info.get('avg_motion_score', 0):.2f}",
-                        ]
-
-                        for i, line in enumerate(label_lines):
-                            y_offset = int(y1) - 10 - (len(label_lines) - 1 - i) * 20
-                            cv2.putText(
-                                processed_frame,
-                                line,
-                                (int(x1), y_offset),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.6,
-                                (0, 0, 255),
-                                2,
-                            )
-
-                        detections.append(
-                            {
-                                "class": class_name,
-                                "type": "dynamic",
-                                "confidence": confidence,
-                                "bbox": [int(x1), int(y1), int(x2), int(y2)],
-                                "motion_info": motion_info,
-                            }
-                        )
-
-                    else:
-                        # === STATIC FIRE (Image/Poster) ===
-                        static_fire_detected = True
-
-                        # Draw GRAY bounding box
-                        cv2.rectangle(
+                        cv2.putText(
                             processed_frame,
-                            (int(x1), int(y1)),
-                            (int(x2), int(y2)),
-                            (128, 128, 128),  # Gray
-                            2,
+                            label,
+                            (int(x1), int(y1) - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6,
+                            color,
+                            2
                         )
 
-                        # Draw label
-                        label_lines = [
-                            f"STATIC {class_name} {confidence:.2f}",
-                            f"Motion: {motion_info.get('motion_ratio', 0) * 100:.1f}%",
-                        ]
-
-                        for i, line in enumerate(label_lines):
-                            y_offset = int(y1) - 10 - (len(label_lines) - 1 - i) * 20
-                            cv2.putText(
-                                processed_frame,
-                                line,
-                                (int(x1), y_offset),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.5,
-                                (128, 128, 128),
-                                1,
-                            )
-
-                        detections.append(
-                            {
-                                "class": class_name,
-                                "type": "static",
-                                "confidence": 0.0,  # Static = not real fire
-                                "bbox": [int(x1), int(y1), int(x2), int(y2)],
-                                "motion_info": motion_info,
-                            }
-                        )
-
-            # === STEP 4: Update detection state ===
-            with self.detection_lock:
-                self.dynamic_fire_detected = dynamic_fire_detected
-                self.static_fire_detected = static_fire_detected
-                self.fire_detected = dynamic_fire_detected  # Only DYNAMIC counts
-
-                if dynamic_fire_detected:
-                    self.last_detection_time = time.time()
-                    self.detection_count += 1
-
-            # === STEP 5: Logging ===
-            if dynamic_fire_detected:
-                logger.warning(
-                    f"[FireDetector] 🔥 YOLO DYNAMIC FIRE! "
-                    f"{len([d for d in detections if d['type'] == 'dynamic'])} detection(s)"
-                )
-            elif static_fire_detected:
-                logger.info(f"[FireDetector] YOLO static fire detected (no motion)")
+                        detections.append({
+                            "class": class_name,
+                            "confidence": float(confidence),
+                            "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                            "motion": motion_info,
+                            "dynamic": is_dynamic
+                        })
 
             return processed_frame, dynamic_fire_detected, detections
 
         except Exception as e:
             logger.error(f"[FireDetector] YOLO detection error: {e}")
             return frame, False, []
-
     def _analyze_motion_in_region(self, fire_mask):
         """
         Analyze motion/turbulence in fire regions across multiple frames
@@ -348,7 +235,8 @@ class FireDetector:
             masked_diff = cv2.bitwise_and(frame_diff, frame_diff, mask=fire_mask)
 
             # Count pixels with significant change
-            motion_pixels = np.sum(masked_diff > self.motion_pixel_threshold)
+            # motion_pixels = np.sum(masked_diff > self.motion_pixel_threshold)
+            motion_pixels = np.sum(masked_diff > 25)  # tăng threshold
 
             # Calculate motion ratio (percentage of fire region that changed)
             fire_region_pixels = np.sum(fire_mask > 0)
@@ -541,7 +429,14 @@ class FireDetector:
             # L channel = Lightness (0=black, 255=white)
             # Flames are ALWAYS bright, regardless of color
             l_channel, _, _ = cv2.split(lab)
-            bright_mask = (l_channel > 180).astype(np.uint8) * 255
+            # bright_mask = (l_channel > 180).astype(np.uint8) * 255
+            # masks.append(bright_mask)
+            # ❌ BỎ hoặc giảm ảnh hưởng ánh sáng mạnh
+            bright_mask = (l_channel > 200).astype(np.uint8) * 255
+
+            # chỉ giữ nếu có màu lửa đi kèm
+            bright_mask = cv2.bitwise_and(bright_mask, high_sat_mask)
+
             masks.append(bright_mask)
 
             # === Combine all masks ===
@@ -558,7 +453,7 @@ class FireDetector:
             # - Lửa xanh: S > 120
             # - Ánh sáng trời/cửa sổ: S < 80 → BỊ LOẠI BỎ
             # - Đèn trắng: S < 50 → BỊ LOẠI BỎ
-            min_saturation = 80  # Ngưỡng tối thiểu
+            min_saturation = 100  # Ngưỡng tối thiểu
             high_sat_mask = (s_channel > min_saturation).astype(np.uint8) * 255
 
             # AND với fire_mask (chỉ giữ vùng có màu đậm)
@@ -596,7 +491,7 @@ class FireDetector:
             static_fire_detected = False
 
             # Filter contours by area
-            min_area = 500
+            min_area = 1200
             for contour in contours:
                 area = cv2.contourArea(contour)
                 if area < min_area:

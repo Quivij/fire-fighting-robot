@@ -63,7 +63,19 @@ class CameraHandler:
         # yolo_model_path = os.path.join(
         #     os.path.dirname(__file__), "models", "yolov5s_best.pt"
         # )
-        yolo_model_path = ""
+        BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+        yolo_model_path = os.path.join(
+            BASE_DIR,
+            "fire detection.v2i.yolov8",
+            "runs",
+            "detect",
+            "train",
+            "weights",
+            "best.pt",
+        )
+
+        print("YOLO PATH:", yolo_model_path)
 
         if os.path.exists(yolo_model_path):
             logger.info(
