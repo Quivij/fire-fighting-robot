@@ -1,6 +1,7 @@
 import time
 import threading
 import logging
+import random
 
 from config import (
     TOPIC_MOTOR_CONTROL,
@@ -14,149 +15,239 @@ logger = logging.getLogger(__name__)
 
 
 class AutoController:
-    """
-    AutoController
-    =================
-    - Quay tìm lửa khi chưa phát hiện
-    - Khi xác nhận có lửa:
-        + Dừng robot
-        + Bật bơm
-    """
-
-    def __init__(self, mqtt_handler, camera_handler):
+    def __init__(self, mqtt_handler, camera_handler, sensor_handler):
         self.mqtt = mqtt_handler
         self.camera = camera_handler
+        self.sensor = sensor_handler
 
         self.auto_mode = False
         self._thread = None
         self._stop_event = threading.Event()
 
-        # -------- FILTER / DEBOUNCE --------
-        self.fire_counter = 0
-        self.FIRE_CONFIRM_COUNT = 3  # số lần liên tiếp cần thấy lửa
+        self.state = "SEARCH"
 
-    # =================================================
-    # PUBLIC METHODS
-    # =================================================
+        # debounce
+        self.fire_count = 0
+        self.flame_count = 0
+        self.no_fire_count = 0
 
+        # anti spam
+        self.last_action = None
+        self.last_speed = 0
+        self.last_time = 0
+
+    # =============================
+    # LOOP
+    # =============================
+    def _loop(self):
+        delay = 1.0 / AUTO_CONTROL_LOOP_HZ
+
+        while not self._stop_event.is_set():
+            try:
+                cam = self.camera.get_fire_status()
+                sensor = self.sensor.get_all()
+
+                cam_detected = cam.get("detected", False)
+                flame = sensor.get("flame_digital", False)
+                distance = sensor.get("distance", -1)
+
+                print(f"[DEBUG] fire={cam_detected}, flame={flame}, dist={distance}, state={self.state}")
+
+                # ===== FILTER =====
+                self.fire_count = self.fire_count + 1 if cam_detected else 0
+                self.flame_count = self.flame_count + 1 if flame else 0
+
+                fire_ok = self.fire_count >= 3
+                flame_ok = self.flame_count >= 2
+
+                # =============================
+                # 🚧 OBSTACLE (ưu tiên cao nhất)
+                # =============================
+                if 0 < distance < 25:
+                    self._handle_obstacle()
+
+                # =============================
+                # 🔥 EXTINGUISH (rất gần)
+                # =============================
+                elif flame_ok:
+                    self._handle_extinguish(distance)
+
+                # =============================
+                # 🎯 TRACK FIRE
+                # =============================
+                elif fire_ok:
+                    self.no_fire_count = 0
+                    self._handle_tracking(cam, distance)
+
+                # =============================
+                # 🔍 SEARCH
+                # =============================
+                else:
+                    self.no_fire_count += 1
+                    self._handle_search()
+
+                time.sleep(delay)
+
+            except Exception as e:
+                logger.error(f"[AUTO ERROR] {e}")
+                time.sleep(1)
+
+    # =============================
+    # SPEED CONTROL
+    # =============================
+    def _get_speed_by_distance(self, distance):
+        if distance <= 0:
+            return AUTO_SPEED_FORWARD
+
+        if distance < 20:
+            return 0
+        elif distance < 30:
+            return 70
+        elif distance < 60:
+            return 110
+        else:
+            return AUTO_SPEED_FORWARD
+
+    # =============================
+    # 🚧 OBSTACLE
+    # =============================
+    def _handle_obstacle(self):
+        if self.state != "AVOID":
+            logger.warning("🚧 OBSTACLE → AVOID")
+            self.state = "AVOID"
+
+        # dừng mạnh
+        self._send_motor("stop", 0)
+        time.sleep(0.3)
+
+        # lùi ra
+        self._send_motor("backward", 100)
+        time.sleep(0.3)
+
+        # quay
+        direction = random.choice(["left", "right"])
+        self._send_motor(direction, AUTO_SPEED_TURN)
+        time.sleep(0.4)
+
+    # =============================
+    # 🔥 EXTINGUISH
+    # =============================
+    def _handle_extinguish(self, distance):
+        if self.state != "EXTINGUISH":
+            logger.warning("🔥 EXTINGUISH")
+            self.state = "EXTINGUISH"
+
+        # gần → dừng hẳn
+        if distance < 20:
+            self._send_motor("stop", 0)
+        else:
+            self._send_motor("forward", 80)
+
+        self._pump("on")
+
+    # =============================
+    # 🎯 TRACK
+    # =============================
+    def _handle_tracking(self, fire, distance):
+        x = fire.get("x_center")
+        w = fire.get("frame_width")
+
+        if not x or not w:
+            return
+
+        if self.state != "TRACK":
+            logger.info("🎯 TRACK")
+            self.state = "TRACK"
+
+        offset = (x - w / 2) / (w / 2)
+        speed = self._get_speed_by_distance(distance)
+
+        self._pump("off")
+
+        # ⭐ FIX QUAN TRỌNG: dừng thật
+        if speed == 0:
+            self._send_motor("stop", 0)
+            return
+
+        if abs(offset) < 0.2:
+            self._send_motor("forward", speed)
+        elif offset < 0:
+            self._send_motor("left", AUTO_SPEED_TURN)
+        else:
+            self._send_motor("right", AUTO_SPEED_TURN)
+
+    # =============================
+    # 🔍 SEARCH
+    # =============================
+    def _handle_search(self):
+        if self.state != "SEARCH":
+            logger.info("🔍 SEARCH (FORWARD SLOW)")
+            self.state = "SEARCH"
+
+            self._send_motor("forward", 60)  # chạy chậm
+            self._pump("off")
+
+    # =============================
+    # MQTT
+    # =============================
+    def _send_motor(self, action, speed):
+        now = time.time()
+
+        # chống spam
+        if (
+            action == self.last_action
+            and abs(speed - self.last_speed) < 5
+            and now - self.last_time < 0.2
+        ):
+            return
+
+        payload = {
+            "action": action,
+            "speed": int(speed),
+        }
+
+        print(f"[SEND] MOTOR: {payload}")
+        self.mqtt.publish(TOPIC_MOTOR_CONTROL, payload)
+
+        self.last_action = action
+        self.last_speed = speed
+        self.last_time = now
+
+    def _pump(self, state):
+        payload = {"state": state}
+        print(f"[SEND] PUMP: {payload}")
+        self.mqtt.publish(TOPIC_PUMP_CONTROL, payload)
+
+    # =============================
+    # CONTROL
+    # =============================
     def enable_auto_mode(self):
         if self.auto_mode:
-            logger.warning("[AutoController] Auto mode already enabled")
             return False
+
+        logger.warning("🤖 AUTO MODE ENABLED")
 
         self.auto_mode = True
         self._stop_event.clear()
 
-        self._thread = threading.Thread(
-            target=self._auto_loop, daemon=True
-        )
+        self._thread = threading.Thread(target=self._loop)
         self._thread.start()
 
-        logger.warning("[AutoController] 🤖 AUTO MODE ENABLED")
         return True
 
     def disable_auto_mode(self):
         if not self.auto_mode:
-            logger.warning("[AutoController] Auto mode already disabled")
             return False
+
+        logger.info("🛑 AUTO MODE DISABLED")
 
         self.auto_mode = False
         self._stop_event.set()
 
-        # an toàn
-        self._stop_robot()
-        self._pump_off()
-
-        logger.info("[AutoController] AUTO MODE DISABLED")
         return True
 
     def get_status(self):
         return {
             "auto_mode": self.auto_mode,
-            "thread_alive": self._thread.is_alive()
-            if self._thread
-            else False,
-            "loop_hz": AUTO_CONTROL_LOOP_HZ,
+            "state": self.state
         }
-
-    # =================================================
-    # AUTO LOOP
-    # =================================================
-
-    def _auto_loop(self):
-        logger.info("[AutoController] Auto loop started")
-        loop_delay = 1.0 / AUTO_CONTROL_LOOP_HZ
-
-        while not self._stop_event.is_set():
-            try:
-                fire_status = self.camera.get_fire_status()
-
-                # -------- DEBOUNCE --------
-                if fire_status.get("detected"):
-                    self.fire_counter += 1
-                else:
-                    self.fire_counter = 0
-
-                fire_confirmed = (
-                    self.fire_counter >= self.FIRE_CONFIRM_COUNT
-                )
-
-                # -------- LOGIC --------
-                if fire_confirmed:
-                    logger.warning("🔥 FIRE CONFIRMED")
-
-                    self._stop_robot()
-                    self._pump_on()
-                else:
-                    self._search_fire()
-                    self._pump_off()
-
-                time.sleep(loop_delay)
-
-            except Exception as e:
-                logger.error(f"[AutoController] Error: {e}")
-                time.sleep(1)
-
-        logger.info("[AutoController] Auto loop stopped")
-
-    # =================================================
-    # MOVEMENT
-    # =================================================
-
-    def _move_forward(self, speed):
-        self._publish_motor("forward", speed)
-
-    def _turn_left(self, speed):
-        self._publish_motor("left", speed)
-
-    def _stop_robot(self):
-        self._publish_motor("stop", 0)
-
-    def _search_fire(self):
-        logger.info("[AutoController] Searching for fire...")
-        self._turn_left(AUTO_SPEED_TURN)
-
-    # =================================================
-    # PUMP
-    # =================================================
-
-    def _pump_on(self):
-        self._publish_pump("on")
-
-    def _pump_off(self):
-        self._publish_pump("off")
-
-    # =================================================
-    # MQTT HELPERS
-    # =================================================
-
-    def _publish_motor(self, action, speed):
-        payload = {
-            "action": action,
-            "speed": speed,
-        }
-        self.mqtt.publish(TOPIC_MOTOR_CONTROL, payload)
-
-    def _publish_pump(self, state):
-        payload = {"state": state}
-        self.mqtt.publish(TOPIC_PUMP_CONTROL, payload)

@@ -2,11 +2,13 @@ import logging
 from datetime import datetime
 
 from flask import Flask, Response, jsonify, request
+from sensor_handler import SensorHandler
 from flask_cors import CORS
 from flask_socketio import SocketIO
 
 from auto_controller import AutoController
 from camera_handler import CameraHandler
+
 
 # Import các module đã tạo
 from config import (
@@ -55,6 +57,7 @@ socketio = SocketIO(
 
 # Khởi tạo MQTT Handler
 mqtt_handler = MQTTHandler(socketio)
+sensor_handler = SensorHandler(mqtt_handler)
 
 # Khởi tạo WebSocket Handler
 ws_handler = WebSocketHandler(mqtt_handler, socketio)
@@ -66,7 +69,11 @@ ws_handler.register_events()
 camera_handler = CameraHandler(ESP32_CAM_URL)
 
 # Khởi tạo Auto Controller
-auto_controller = AutoController(mqtt_handler, camera_handler)
+auto_controller = AutoController(
+    mqtt_handler,
+    camera_handler,
+    sensor_handler
+)
 
 
 # ===== REST API ENDPOINTS =====

@@ -59,7 +59,7 @@ const char* TOPIC_SENSOR_FLAME = "robot/sensors/flame";
 #define R_IN1 16
 #define R_IN2 17
 #define R_IN3 5
-#define R_IN4 18
+#define R_IN4 21
 #define R_ENB 32
 
 // Pump Control
@@ -67,7 +67,7 @@ const char* TOPIC_SENSOR_FLAME = "robot/sensors/flame";
 
 // Sensor Pins
 #define ULTRASONIC_TRIG 18  // HC-SR04 Trigger
-#define ULTRASONIC_ECHO 19  // HC-SR04 Echo1
+#define ULTRASONIC_ECHO 35  // HC-SR04 Echo1
 #define FLAME_ANALOG 34     // Flame Sensor Analog Output
 #define FLAME_DIGITAL 4     // Flame Sensor Digital Output
 
@@ -92,6 +92,9 @@ PubSubClient mqtt(espClient);
 // Robot State
 String currentMotorState = "stop";
 int currentSpeed = 0;
+int currentPWM = 0;
+unsigned long lastCommandTime = 0;
+
 // bool pumpState = false;
 
 // Timing Variables
@@ -136,32 +139,42 @@ void setupMotors() {
   motorStop();
   Serial.println("[SETUP] Motors ready");
 }
-
-
+// MOTOR CONTROL FUNCTIONS
 void motorForward(uint8_t speed) {
-  digitalWrite(L_IN1, LOW);  digitalWrite(L_IN2, HIGH);
-  digitalWrite(L_IN3, LOW);  digitalWrite(L_IN4, HIGH);
+  // LEFT SIDE (đảo lại)
+  digitalWrite(L_IN1, HIGH);  
+  digitalWrite(L_IN2, LOW);
+  digitalWrite(L_IN3, HIGH);  
+  digitalWrite(L_IN4, LOW);
 
-  // RIGHT SIDE
-  digitalWrite(R_IN1, LOW);  digitalWrite(R_IN2, HIGH);
-  digitalWrite(R_IN3, LOW);  digitalWrite(R_IN4, HIGH);
+  // RIGHT SIDE (đảo lại)
+  digitalWrite(R_IN1, HIGH);  
+  digitalWrite(R_IN2, LOW);
+  digitalWrite(R_IN3, HIGH);  
+  digitalWrite(R_IN4, LOW);
 
   ledcWrite(L_ENA, speed);
   ledcWrite(L_ENB, speed);
   ledcWrite(R_ENA, speed);
   ledcWrite(R_ENB, speed);
+
   currentMotorState = "forward";
   currentSpeed = speed;
   Serial.printf("[MOTOR] Forward - Speed: %d\n", speed);
 }
 
 void motorBackward(uint8_t speed) {
-  digitalWrite(L_IN1, HIGH); digitalWrite(L_IN2, LOW);
-  digitalWrite(L_IN3, HIGH); digitalWrite(L_IN4, LOW);
+  // LEFT SIDE (đảo lại)
+  digitalWrite(L_IN1, LOW);  
+  digitalWrite(L_IN2, HIGH);
+  digitalWrite(L_IN3, LOW);  
+  digitalWrite(L_IN4, HIGH);
 
-  // RIGHT SIDE
-  digitalWrite(R_IN1, HIGH); digitalWrite(R_IN2, LOW);
-  digitalWrite(R_IN3, HIGH); digitalWrite(R_IN4, LOW);
+  // RIGHT SIDE (đảo lại)
+  digitalWrite(R_IN1, LOW);  
+  digitalWrite(R_IN2, HIGH);
+  digitalWrite(R_IN3, LOW);  
+  digitalWrite(R_IN4, HIGH);
 
   ledcWrite(L_ENA, speed);
   ledcWrite(L_ENB, speed);
@@ -172,42 +185,52 @@ void motorBackward(uint8_t speed) {
   currentSpeed = speed;
   Serial.printf("[MOTOR] Backward - Speed: %d\n", speed);
 }
-
 void motorLeft(uint8_t speed) {
-  digitalWrite(L_IN1, LOW); digitalWrite(L_IN2, LOW);
-  digitalWrite(L_IN3, LOW); digitalWrite(L_IN4, LOW);
+  uint8_t slowSpeed = speed * 0.4;
 
-  // RIGHT FORWARD
-  digitalWrite(R_IN1, LOW); digitalWrite(R_IN2, HIGH);
-  digitalWrite(R_IN3, LOW); digitalWrite(R_IN4, HIGH);
+  // LEFT SIDE (chạy chậm - tiến)
+  digitalWrite(L_IN1, HIGH);  
+  digitalWrite(L_IN2, LOW);
+  digitalWrite(L_IN3, HIGH);  
+  digitalWrite(L_IN4, LOW);
 
-  ledcWrite(L_ENA, 0);
-  ledcWrite(L_ENB, 0);
+  // RIGHT SIDE (chạy nhanh - ĐẢO CHIỀU)
+  digitalWrite(R_IN1, LOW);   // đảo tại đây
+  digitalWrite(R_IN2, HIGH);
+  digitalWrite(R_IN3, LOW);
+  digitalWrite(R_IN4, HIGH);
+
+  ledcWrite(L_ENA, slowSpeed);
+  ledcWrite(L_ENB, slowSpeed);
   ledcWrite(R_ENA, speed);
   ledcWrite(R_ENB, speed);
 
   currentMotorState = "left";
   currentSpeed = speed;
-  Serial.printf("[MOTOR] Turn Left - Speed: %d\n", speed);
 }
-
 void motorRight(uint8_t speed) {
-  digitalWrite(R_IN1, LOW); digitalWrite(R_IN2, LOW);
-  digitalWrite(R_IN3, LOW); digitalWrite(R_IN4, LOW);
+  uint8_t slowSpeed = speed * 0.4;
 
-  // LEFT FORWARD
-  digitalWrite(L_IN1, LOW); digitalWrite(L_IN2, HIGH);
-  digitalWrite(L_IN3, LOW); digitalWrite(L_IN4, HIGH);
+  // LEFT SIDE (chạy nhanh - tiến)
+  digitalWrite(L_IN1, HIGH);  
+  digitalWrite(L_IN2, LOW);
+  digitalWrite(L_IN3, HIGH);  
+  digitalWrite(L_IN4, LOW);
+
+  // RIGHT SIDE (chạy chậm - ĐẢO CHIỀU)
+  digitalWrite(R_IN1, LOW);   // đảo tại đây
+  digitalWrite(R_IN2, HIGH);
+  digitalWrite(R_IN3, LOW);
+  digitalWrite(R_IN4, HIGH);
 
   ledcWrite(L_ENA, speed);
   ledcWrite(L_ENB, speed);
-  ledcWrite(R_ENA, 0);
-  ledcWrite(R_ENB, 0);
+  ledcWrite(R_ENA, slowSpeed);
+  ledcWrite(R_ENB, slowSpeed);
+
   currentMotorState = "right";
   currentSpeed = speed;
-  Serial.printf("[MOTOR] Turn Right - Speed: %d\n", speed);
 }
-
 void motorStop() {
   digitalWrite(L_IN1, LOW); digitalWrite(L_IN2, LOW);
   digitalWrite(L_IN3, LOW); digitalWrite(L_IN4, LOW);
@@ -310,12 +333,27 @@ void readFlame() {
   // ESP32 ADC: 0-4095 (12-bit)
   currentFlameAnalog = analogRead(FLAME_ANALOG);
 }
+float readDistanceFiltered() {
+  float sum = 0;
+  int count = 0;
+
+  for (int i = 0; i < 3; i++) {
+    float d = readDistance();
+    if (d > 0) {
+      sum += d;
+      count++;
+    }
+    delay(5);
+  }
+
+  return count ? sum / count : -1;
+}
 
 void publishSensorData() {
   if (!mqtt.connected()) return;
 
   // Read sensors
-  currentDistance = readDistance();
+  currentDistance = readDistanceFiltered();
   readFlame();
 
   // Publish Distance
@@ -348,7 +386,6 @@ void publishSensorData() {
                 currentFlameDigital ? "DETECTED" : "No fire", 
                 currentFlameAnalog);
 }
-
 // WiFi FUNCTIONS
 
 void connectWiFi() {
@@ -425,6 +462,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     
     // Constrain speed to safe range
     speed = constrain(speed, MIN_MOTOR_SPEED, MAX_MOTOR_SPEED);
+    lastCommandTime = millis();
 
     // Execute motor command
     if (strcmp(action, "forward") == 0) {
@@ -564,10 +602,11 @@ void setup() {
   // Initialize Hardware
   setupMotors();
   // setupPump();
-  // setupSensors();
+  setupSensors();
 
   // CRITICAL: Ensure pump is OFF before any MQTT activity
   // pumpOff();
+
   delay(100); // Small delay to ensure relay is OFF
 
   // Connect to WiFi
@@ -591,38 +630,35 @@ void setup() {
 
 
 // MAIN LOOP - OPTIMIZED FOR LOW LATENCY
-
 void loop() {
-  // Check WiFi connection every 30 seconds
   if (millis() - lastWiFiCheck > WIFI_CHECK_INTERVAL) {
     checkWiFi();
     lastWiFiCheck = millis();
   }
 
-  // Check MQTT connection
   if (!mqtt.connected()) {
     mqttConnected = false;
     connectMQTT();
   }
 
-  // Phải chạy liên tục để nhận lệnh realtime!
   mqtt.loop();
 
-  // Publish status every 1 second
+  // STATUS
   if (millis() - lastStatusUpdate >= STATUS_INTERVAL) {
     publishStatus();
     lastStatusUpdate = millis();
   }
 
-  // Publish sensor data every 500ms
+  // SENSOR ONLY (KHÔNG autoSafety nữa)
   if (millis() - lastSensorUpdate >= SENSOR_INTERVAL) {
     publishSensorData();
     lastSensorUpdate = millis();
   }
 
-  // VERY SHORT DELAY - Quan trọng cho latency thấp!
-  // Chỉ 5ms để mqtt.loop() kịp chạy
+  // 🚨 FAILSAFE: mất MQTT → dừng
+  if (millis() - lastCommandTime > COMMAND_TIMEOUT) {
+    motorStop();
+  }
+
   delay(5);
 }
-
-
