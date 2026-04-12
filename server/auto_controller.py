@@ -7,8 +7,6 @@ from config import (
     TOPIC_MOTOR_CONTROL,
     TOPIC_PUMP_CONTROL,
     AUTO_CONTROL_LOOP_HZ,
-    AUTO_SPEED_FORWARD,
-    AUTO_SPEED_TURN,
 )
 
 logger = logging.getLogger(__name__)
@@ -25,19 +23,22 @@ class AutoController:
         self._stop_event = threading.Event()
 
         self.state = "SEARCH"
+        self.state_time = time.time()
 
         # debounce
         self.fire_count = 0
         self.flame_count = 0
-        self.no_fire_count = 0
 
-        # anti spam
+        # anti spam motor
         self.last_action = None
         self.last_speed = 0
         self.last_time = 0
 
+        # anti spam pump
+        self.last_pump_state = None
+
     # =============================
-    # LOOP
+    # MAIN LOOP
     # =============================
     def _loop(self):
         delay = 1.0 / AUTO_CONTROL_LOOP_HZ
@@ -47,11 +48,12 @@ class AutoController:
                 cam = self.camera.get_fire_status()
                 sensor = self.sensor.get_all()
 
+                # ===== DATA =====
                 cam_detected = cam.get("detected", False)
-                flame = sensor.get("flame_digital", False)
+                flame = sensor.get("detected", False)  # ✅ FIX
                 distance = sensor.get("distance", -1)
 
-                print(f"[DEBUG] fire={cam_detected}, flame={flame}, dist={distance}, state={self.state}")
+                print(f"[AUTO] fire={cam_detected}, flame={flame}, dist={distance}, state={self.state}")
 
                 # ===== FILTER =====
                 self.fire_count = self.fire_count + 1 if cam_detected else 0
@@ -60,30 +62,17 @@ class AutoController:
                 fire_ok = self.fire_count >= 3
                 flame_ok = self.flame_count >= 2
 
-                # =============================
-                # 🚧 OBSTACLE (ưu tiên cao nhất)
-                # =============================
-                if 0 < distance < 25:
-                    self._handle_obstacle()
-
-                # =============================
-                # 🔥 EXTINGUISH (rất gần)
-                # =============================
-                elif flame_ok:
+                # ===== PRIORITY =====
+                if flame_ok:
                     self._handle_extinguish(distance)
 
-                # =============================
-                # 🎯 TRACK FIRE
-                # =============================
+                elif 0 < distance < 50:
+                    self._handle_obstacle()
+
                 elif fire_ok:
-                    self.no_fire_count = 0
                     self._handle_tracking(cam, distance)
 
-                # =============================
-                # 🔍 SEARCH
-                # =============================
                 else:
-                    self.no_fire_count += 1
                     self._handle_search()
 
                 time.sleep(delay)
@@ -93,43 +82,6 @@ class AutoController:
                 time.sleep(1)
 
     # =============================
-    # SPEED CONTROL
-    # =============================
-    def _get_speed_by_distance(self, distance):
-        if distance <= 0:
-            return AUTO_SPEED_FORWARD
-
-        if distance < 20:
-            return 0
-        elif distance < 30:
-            return 70
-        elif distance < 60:
-            return 110
-        else:
-            return AUTO_SPEED_FORWARD
-
-    # =============================
-    # 🚧 OBSTACLE
-    # =============================
-    def _handle_obstacle(self):
-        if self.state != "AVOID":
-            logger.warning("🚧 OBSTACLE → AVOID")
-            self.state = "AVOID"
-
-        # dừng mạnh
-        self._send_motor("stop", 0)
-        time.sleep(0.3)
-
-        # lùi ra
-        self._send_motor("backward", 100)
-        time.sleep(0.3)
-
-        # quay
-        direction = random.choice(["left", "right"])
-        self._send_motor(direction, AUTO_SPEED_TURN)
-        time.sleep(0.4)
-
-    # =============================
     # 🔥 EXTINGUISH
     # =============================
     def _handle_extinguish(self, distance):
@@ -137,11 +89,16 @@ class AutoController:
             logger.warning("🔥 EXTINGUISH")
             self.state = "EXTINGUISH"
 
-        # gần → dừng hẳn
-        if distance < 20:
+        SAFE_DISTANCE = 40
+
+        if distance <= 0:
+            self._send_motor("forward", 30)
+
+        elif distance < SAFE_DISTANCE:
             self._send_motor("stop", 0)
+
         else:
-            self._send_motor("forward", 80)
+            self._send_motor("forward", 40)
 
         self._pump("on")
 
@@ -164,36 +121,75 @@ class AutoController:
 
         self._pump("off")
 
-        # ⭐ FIX QUAN TRỌNG: dừng thật
         if speed == 0:
             self._send_motor("stop", 0)
             return
 
-        if abs(offset) < 0.2:
+        if abs(offset) < 0.15:
             self._send_motor("forward", speed)
         elif offset < 0:
-            self._send_motor("left", AUTO_SPEED_TURN)
+            self._send_motor("left", speed)
         else:
-            self._send_motor("right", AUTO_SPEED_TURN)
+            self._send_motor("right", speed)
+
+    # =============================
+    # 🚧 OBSTACLE
+    # =============================
+    def _handle_obstacle(self):
+        now = time.time()
+
+        if self.state != "AVOID":
+            logger.warning("🚧 OBSTACLE")
+            self.state = "AVOID"
+            self.state_time = now
+
+        elapsed = now - self.state_time
+
+        if elapsed < 0.5:
+            self._send_motor("stop", 0)
+
+        elif elapsed < 1.2:
+            self._send_motor("backward", 40)
+
+        elif elapsed < 2.0:
+            self._send_motor(random.choice(["left", "right"]), 60)
+
+        else:
+            self.state = "SEARCH"
 
     # =============================
     # 🔍 SEARCH
     # =============================
     def _handle_search(self):
         if self.state != "SEARCH":
-            logger.info("🔍 SEARCH (FORWARD SLOW)")
+            logger.info("🔍 SEARCH")
             self.state = "SEARCH"
 
-            self._send_motor("forward", 60)  # chạy chậm
-            self._pump("off")
+        self._send_motor("forward", 50)
+        self._pump("off")
 
     # =============================
-    # MQTT
+    # ⚡ SPEED CONTROL
+    # =============================
+    def _get_speed_by_distance(self, distance):
+        if distance <= 0:
+            return 80
+
+        if distance < 30:
+            return 0
+        elif distance < 50:
+            return 20
+        elif distance < 80:
+            return 40
+        else:
+            return 80
+
+    # =============================
+    # 🚀 MOTOR (ANTI SPAM)
     # =============================
     def _send_motor(self, action, speed):
         now = time.time()
 
-        # chống spam
         if (
             action == self.last_action
             and abs(speed - self.last_speed) < 5
@@ -213,10 +209,19 @@ class AutoController:
         self.last_speed = speed
         self.last_time = now
 
+    # =============================
+    # 💦 PUMP (ANTI SPAM)
+    # =============================
     def _pump(self, state):
+        if state == self.last_pump_state:
+            return
+
         payload = {"state": state}
+
         print(f"[SEND] PUMP: {payload}")
         self.mqtt.publish(TOPIC_PUMP_CONTROL, payload)
+
+        self.last_pump_state = state
 
     # =============================
     # CONTROL
@@ -249,5 +254,5 @@ class AutoController:
     def get_status(self):
         return {
             "auto_mode": self.auto_mode,
-            "state": self.state
+            "state": self.state,
         }

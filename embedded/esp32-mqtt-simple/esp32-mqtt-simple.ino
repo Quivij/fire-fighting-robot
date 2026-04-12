@@ -12,7 +12,6 @@
 
 //  INCLUDE LIBRARIES 
 #include <Arduino.h>
-
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
@@ -36,7 +35,7 @@ int connectedNetworkIndex = -1;
 
 // MQTT Topics
 const char* TOPIC_MOTOR_CONTROL = "robot/control/motor";
-// const char* TOPIC_PUMP_CONTROL = "robot/control/pump";
+const char* TOPIC_PUMP_CONTROL = "robot/control/pump";
 const char* TOPIC_STATUS = "robot/status";
 const char* TOPIC_SENSOR_DISTANCE = "robot/sensors/distance";
 const char* TOPIC_SENSOR_FLAME = "robot/sensors/flame";
@@ -63,12 +62,12 @@ const char* TOPIC_SENSOR_FLAME = "robot/sensors/flame";
 #define R_ENB 32
 
 // Pump Control
-//  #define PUMP_RELAY 23   
+ #define PUMP_RELAY 23
 
 // Sensor Pins
 #define ULTRASONIC_TRIG 18  // HC-SR04 Trigger
 #define ULTRASONIC_ECHO 35  // HC-SR04 Echo1
-#define FLAME_ANALOG 34     // Flame Sensor Analog Output
+// #define FLAME_ANALOG 34     // Flame Sensor Analog Output
 #define FLAME_DIGITAL 4     // Flame Sensor Digital Output
 
 // LED Built-in
@@ -95,7 +94,7 @@ int currentSpeed = 0;
 int currentPWM = 0;
 unsigned long lastCommandTime = 0;
 
-// bool pumpState = false;
+bool pumpState = false;
 
 // Timing Variables
 unsigned long lastStatusUpdate = 0;
@@ -107,7 +106,7 @@ bool mqttConnected = false;
 
 // Sensor Data
 float currentDistance = 0.0;
-int currentFlameAnalog = 0;
+// int currentFlameAnalog = 0;
 bool currentFlameDigital = false;
 
 // MOTOR CONTROL FUNCTIONS
@@ -250,54 +249,40 @@ void motorStop() {
 }
 
 // PUMP CONTROL FUNCTIONS
+void setupPump() {
+  Serial.println("[SETUP] Initializing pump...");
 
-// void setupPump() {
-//   Serial.println("[SETUP] Initializing pump...");
+  pinMode(PUMP_RELAY, OUTPUT);
+  digitalWrite(PUMP_RELAY, HIGH); // OFF (relay active LOW)
 
-//   // CRITICAL: Active LOW relay - HIGH = OFF, LOW = ON
-//   pinMode(PUMP_RELAY, OUTPUT);
-//   digitalWrite(PUMP_RELAY, HIGH);  // Pump OFF (relay HIGH for Active LOW)
+  pumpState = false;
 
-//   // Double-check by setting HIGH again
-//   digitalWrite(PUMP_RELAY, HIGH);
-//   pumpState = false;
+  Serial.println("[SETUP] Pump OFF");
+}
 
-//   Serial.println("[SETUP]  Pump initialized (OFF)");
-// }
+void pumpOn() {
+  digitalWrite(PUMP_RELAY, LOW); // ON
+  pumpState = true;
+  Serial.println("[PUMP] ON");
+}
 
-// void pumpOn() {
-//   digitalWrite(PUMP_RELAY, LOW);  // Active LOW: LOW = ON
-//   pumpState = true;
-//   Serial.println("[PUMP] ON");
-// }
-
-// void pumpOff() {
-//   digitalWrite(PUMP_RELAY, HIGH); // Active LOW: HIGH = OFF
-//   pumpState = false;
-//   Serial.println("[PUMP] OFF");
-// }
-
-// void pumpToggle() {
-//   if (pumpState) {
-//     pumpOff();
-//   } else {
-//     pumpOn();
-//   }
-// }
-
-// SENSOR FUNCTIONS
+void pumpOff() {
+  digitalWrite(PUMP_RELAY, HIGH); // OFF
+  pumpState = false;
+  Serial.println("[PUMP] OFF");
+}
 
 void setupSensors() {
   Serial.println("[SETUP] Initializing sensors...");
 
-  // HC-SR04 Ultrasonic
+  // Ultrasonic
   pinMode(ULTRASONIC_TRIG, OUTPUT);
   pinMode(ULTRASONIC_ECHO, INPUT);
   digitalWrite(ULTRASONIC_TRIG, LOW);
 
-  // Flame Sensor
-  pinMode(FLAME_DIGITAL, INPUT_PULLUP);  // Pull-up để tránh floating
-  pinMode(FLAME_ANALOG, INPUT);
+  // Flame Sensor (3 chân)
+  pinMode(FLAME_DIGITAL, INPUT); 
+  // KHÔNG cần INPUT_PULLUP vì module đã có sẵn
 
   Serial.println("[SETUP] Sensors initialized");
 }
@@ -331,7 +316,7 @@ void readFlame() {
 
   // Analog output: Higher value = more IR light (fire)
   // ESP32 ADC: 0-4095 (12-bit)
-  currentFlameAnalog = analogRead(FLAME_ANALOG);
+  // currentFlameAnalog = analogRead(FLAME_ANALOG);
 }
 float readDistanceFiltered() {
   float sum = 0;
@@ -356,7 +341,7 @@ void publishSensorData() {
   currentDistance = readDistanceFiltered();
   readFlame();
 
-  // Publish Distance
+  // ===== DISTANCE =====
   if (currentDistance > 0) {
     StaticJsonDocument<128> distDoc;
     distDoc["distance"] = currentDistance;
@@ -372,19 +357,17 @@ void publishSensorData() {
     Serial.println("[SENSOR] Distance: Out of range");
   }
 
-  // Publish Flame
+  // ===== FLAME (3 CHÂN - DIGITAL ONLY) =====
   StaticJsonDocument<128> flameDoc;
-  flameDoc["digital"] = currentFlameDigital;
-  flameDoc["analog"] = currentFlameAnalog;
+  flameDoc["detected"] = currentFlameDigital;
   flameDoc["timestamp"] = millis();
 
   char flameBuffer[128];
   serializeJson(flameDoc, flameBuffer);
   mqtt.publish(TOPIC_SENSOR_FLAME, flameBuffer);
 
-  Serial.printf("[SENSOR] Flame - Digital: %s, Analog: %d\n", 
-                currentFlameDigital ? "DETECTED" : "No fire", 
-                currentFlameAnalog);
+  Serial.printf("[SENSOR] Flame: %s\n", 
+                currentFlameDigital ? "🔥 FIRE DETECTED" : "No fire");
 }
 // WiFi FUNCTIONS
 
@@ -486,23 +469,19 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
 
   // PUMP CONTROL
-  // else if (strcmp(topic, TOPIC_PUMP_CONTROL) == 0) {
-  //   const char* state = doc["state"];
+  else if (strcmp(topic, TOPIC_PUMP_CONTROL) == 0) {
+    const char* state = doc["state"];
 
-  //   if (strcmp(state, "on") == 0) {
-  //     pumpOn();
-  //   }
-  //   else if (strcmp(state, "off") == 0) {
-  //     pumpOff();
-  //   }
-  //   else if (strcmp(state, "toggle") == 0) {
-  //     pumpToggle();
-  //   }
-  //   else {
-  //     Serial.print("[PUMP] ✗ Unknown state: ");
-  //     Serial.println(state);
-  //   }
-  // }
+    if (strcmp(state, "on") == 0) {
+      pumpOn();
+    }
+    else if (strcmp(state, "off") == 0) {
+      pumpOff();
+    }
+    else {
+      Serial.println("[PUMP] Unknown state");
+    }
+  }
 }
 
 void connectMQTT() {
@@ -524,7 +503,7 @@ void connectMQTT() {
 
       // Subscribe to control topics
       mqtt.subscribe(TOPIC_MOTOR_CONTROL);
-      // mqtt.subscribe(TOPIC_PUMP_CONTROL);
+      mqtt.subscribe(TOPIC_PUMP_CONTROL);
 
       Serial.println("[MQTT] Subscribed to topics:");
       Serial.print("  - ");
@@ -601,7 +580,7 @@ void setup() {
 
   // Initialize Hardware
   setupMotors();
-  // setupPump();
+  setupPump();
   setupSensors();
 
   // CRITICAL: Ensure pump is OFF before any MQTT activity
@@ -658,6 +637,8 @@ void loop() {
   // 🚨 FAILSAFE: mất MQTT → dừng
   if (millis() - lastCommandTime > COMMAND_TIMEOUT) {
     motorStop();
+    pumpOff();
+
   }
 
   delay(5);

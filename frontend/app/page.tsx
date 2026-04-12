@@ -21,8 +21,7 @@ interface SensorDistance {
 }
 
 interface SensorFlame {
-  digital: boolean;
-  analog: number;
+  detected: boolean;
   timestamp: number;
 }
 
@@ -75,12 +74,8 @@ export default function DashboardPage() {
 
     socketIo.on("sensor_flame", (data: SensorFlame) => {
       setSensorFlame(data);
-      console.log(
-        "[Sensor] Flame:",
-        data.digital ? "DETECTED" : "No fire",
-        "- Analog:",
-        data.analog,
-      );
+
+      console.log("[Sensor] Flame:", data.detected ? "🔥 DETECTED" : "No fire");
     });
 
     socketIo.on("error", (error: any) => {
@@ -151,8 +146,7 @@ export default function DashboardPage() {
         else if (key === "s") sendMotorCommand("backward");
         else if (key === "a")
           sendMotorCommand("left", Math.floor(speed)); // Slightly slower for turns
-        else if (key === "d")
-          sendMotorCommand("right", Math.floor(speed));
+        else if (key === "d") sendMotorCommand("right", Math.floor(speed));
         // Pump commands (toggle)
         else if (key === " ") sendPumpCommand("toggle");
         else if (key === "q") sendPumpCommand("on");
@@ -307,7 +301,7 @@ export default function DashboardPage() {
                       : "bg-gray-700 border-gray-600 hover:bg-gray-600"
                   }`}
                   onMouseDown={() =>
-                    sendMotorCommand("right", Math.floor(speed ))
+                    sendMotorCommand("right", Math.floor(speed))
                   }
                   onMouseUp={() => sendMotorCommand("stop", 0)}
                   onMouseLeave={() => sendMotorCommand("stop", 0)}
@@ -464,16 +458,9 @@ export default function DashboardPage() {
                 {sensorFlame ? (
                   <div className="space-y-3">
                     <div className="flex justify-between items-center">
-                      <span className="text-sm text-gray-400">Digital:</span>
+                      <span className="text-sm text-gray-400">Flame:</span>
                       <span className="text-lg font-semibold">
-                        {sensorFlame.digital ? "Detected" : "No Fire"}
-                      </span>
-                    </div>
-
-                    <div className="flex justify-between items-center">
-                      <span className="text-sm text-gray-400">Analog:</span>
-                      <span className="text-lg font-mono">
-                        {sensorFlame.analog}
+                        {sensorFlame.detected ? "🔥 Detected" : "No Fire"}
                       </span>
                     </div>
                   </div>
