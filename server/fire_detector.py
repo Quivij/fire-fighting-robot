@@ -89,25 +89,103 @@ class FireDetector:
             logger.error(f"[FireDetector] Failed to load YOLOv8 model: {e}")
             self.model = None
     def detect_fire(self, frame):
-        """
-        Detect fire in frame
-
-        Args:
-            frame: OpenCV BGR image
-
-        Returns:
-            tuple: (processed_frame, fire_detected, detections)
-                processed_frame: Frame with bounding boxes and labels
-                fire_detected: Boolean (True only for DYNAMIC fire)
-                detections: List of detection dicts with motion info
-        """
         if frame is None:
             return None, False, []
 
-        if self.model:
-            return self._detect_yolo(frame)
-        else:
-            return self._detect_color_based(frame)
+        try:
+            processed = frame.copy()
+            detections = []
+            fire_detected = False
+
+            # =============================
+            # YOLO + COLOR COMBINE
+            # =============================
+
+            yolo_fire = False
+
+            # ===== YOLO =====
+            if self.model:
+                results = self.model(frame, conf=0.3)
+
+                if len(results) > 0 and results[0].boxes is not None:
+                    boxes = results[0].boxes.xyxy.cpu().numpy()
+                    confs = results[0].boxes.conf.cpu().numpy()
+                    classes = results[0].boxes.cls.cpu().numpy()
+
+                    for i in range(len(boxes)):
+                        x1, y1, x2, y2 = boxes[i]
+                        conf = confs[i]
+                        cls = int(classes[i])
+
+                        name = self.model.names[cls].lower()
+
+                        if name != "fire":
+                            continue
+
+                        yolo_fire = True
+                        fire_detected = True
+
+                        cx = int((x1 + x2) / 2)
+
+                        cv2.rectangle(processed, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 255), 2)
+                        cv2.putText(processed, f"YOLO {conf:.2f}",
+                                    (int(x1), int(y1) - 10),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+
+                        detections.append({
+                            "source": "yolo",
+                            "x_center": cx,
+                            "confidence": float(conf)
+                        })
+
+            # ===== COLOR (fallback) =====
+            if not yolo_fire:
+                hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+                lower = np.array([0, 80, 80])
+                upper = np.array([40, 255, 255])
+
+                mask = cv2.inRange(hsv, lower, upper)
+
+                kernel = np.ones((5, 5), np.uint8)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+                for cnt in contours:
+                    area = cv2.contourArea(cnt)
+
+                    if area < 300:
+                        continue
+
+                    x, y, w, h = cv2.boundingRect(cnt)
+                    cx = x + w // 2
+
+                    fire_detected = True
+
+                    cv2.rectangle(processed, (x, y), (x+w, y+h), (0, 255, 255), 2)
+                    cv2.putText(processed, "COLOR FIRE",
+                                (x, y-10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2)
+
+                    detections.append({
+                        "source": "color",
+                        "x_center": cx,
+                        "area": int(area)
+                    })
+
+            # ===== HOLD FIRE (QUAN TRỌNG) =====
+            if fire_detected:
+                self.last_detection_time = time.time()
+
+            fire_still = (time.time() - self.last_detection_time) < 1.5
+
+            return processed, fire_still, detections
+
+        except Exception as e:
+            logger.error(f"[FireDetector] Detect error: {e}")
+            return frame, False, []
     def _detect_yolo(self, frame):
         try:
             frame_processed = self._preprocess_frame(frame)

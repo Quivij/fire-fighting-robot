@@ -32,7 +32,7 @@ class CameraHandler:
         Initialize Camera Handler
 
         Args:
-            esp32_cam_url: Base URL of ESP32-CAM (e.g., "http://192.168.1.100")
+            esp32_cam_url: Base URL of ESP32-CAM (e.g., "http://10.226.176.87")
         """
         self.esp32_cam_url = esp32_cam_url
         self.stream_url = f"{esp32_cam_url}/stream"

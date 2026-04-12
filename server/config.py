@@ -23,7 +23,7 @@ TOPIC_SENSOR_DISTANCE = "robot/sensors/distance"
 TOPIC_SENSOR_FLAME = "robot/sensors/flame"
 
 # ESP32-CAM Configuration
-ESP32_CAM_URL = "http://172.18.4.87"  # IP từ Serial Monitor
+ESP32_CAM_URL = "http://10.226.176.87"  # IP từ Serial Monitor
 
 # AI Performance Configuration
 # Adjust these based on your CPU performance:
