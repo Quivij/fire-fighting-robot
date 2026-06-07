@@ -1,31 +1,24 @@
 /*
  * =====================================================
- * ESP32-CAM MJPEG STREAM SERVER - OPTIMIZED
+ * ESP32-CAM MJPEG STREAM SERVER - RTOS OPTIMIZED
  * =====================================================
  * Board: AI Thinker ESP32-CAM
  * Function: HTTP MJPEG Stream cho fire-fighting robot
  * 
-
- * Endpoints:
- *   - http://<ESP32-CAM-IP>/stream  → MJPEG video stream
- *   - http://<ESP32-CAM-IP>/capture → Single JPEG image
- *   - http://<ESP32-CAM-IP>/status  → Camera status JSON
- *
- * Upload instructions:
- *   1. GPIO0 → GND (enter flash mode)
- *   2. Reset ESP32-CAM
- *   3. Upload via FTDI (TX→RX, RX→TX, 5V→5V, GND→GND)
- *   4. Remove GPIO0 from GND, reset again
+ * RTOS Architecture:
+ * - Task 1 (Core 0): WebServer Task - Xử lý HTTP & Stream (Có thể block khi stream)
+ * - Task 2 (Core 1): Robot Control Task - Điều khiển motor/cảm biến độc lập
  * =====================================================
  */
 
- 
 #include "esp_camera.h"
 #include "esp_wifi.h"
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WiFiClient.h>
 #include "config.h"  // WiFi configuration
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 // ===== CAMERA PINS (AI-Thinker ESP32-CAM) =====
 #define PWDN_GPIO_NUM     32
@@ -63,6 +56,10 @@ unsigned long frameCount = 0;
 unsigned long lastFpsTime = 0;
 float currentFPS = 0.0;
 
+// ===== RTOS TASK HANDLES =====
+TaskHandle_t serverTaskHandle = NULL;
+TaskHandle_t robotTaskHandle  = NULL;
+
 // ===== PRE-ALLOCATED BUFFERS (avoid heap fragmentation) =====
 #define PART_BOUNDARY "frame"
 static const char* _STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
@@ -93,21 +90,21 @@ bool initCamera() {
   config.pin_sscb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 24000000;  // 24MHz for better FPS (was 20MHz)
+  config.xclk_freq_hz = 24000000;  // 24MHz for better FPS
   config.pixel_format = PIXFORMAT_JPEG;
-  config.grab_mode = CAMERA_GRAB_LATEST;  // Always get latest frame (skip old frames)
+  config.grab_mode = CAMERA_GRAB_LATEST;
 
-  // Frame size & quality - OPTIMIZED FOR 10-15 FPS STABLE
+  // Frame size & quality - OPTIMIZED
   if (psramFound()) {
     Serial.println("[CAMERA] PSRAM found");
-    config.frame_size = FRAMESIZE_VGA;   // 640x480 - good balance
+    config.frame_size = FRAMESIZE_VGA;   // 640x480
     config.jpeg_quality = JPEG_QUALITY_DEFAULT;  // From config.h
-    config.fb_count = 2;                  // 2 buffers for smooth streaming
-    config.fb_location = CAMERA_FB_IN_PSRAM;  // Use PSRAM for frame buffers
+    config.fb_count = 2;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
   } else {
     Serial.println("[CAMERA] No PSRAM - using QVGA");
     config.frame_size = FRAMESIZE_QVGA;  // 320x240
-    config.jpeg_quality = JPEG_QUALITY_HIGH;  // Better quality for smaller frame
+    config.jpeg_quality = JPEG_QUALITY_HIGH;
     config.fb_count = 1;
     config.fb_location = CAMERA_FB_IN_DRAM;
   }
@@ -122,22 +119,21 @@ bool initCamera() {
   // Get sensor for adjustments
   sensor_t* s = esp_camera_sensor_get();
   if (s != NULL) {
-    // Camera settings tuning for best quality/performance
-    s->set_brightness(s, 0);     // -2 to 2
-    s->set_contrast(s, 0);       // -2 to 2
-    s->set_saturation(s, 0);     // -2 to 2
-    s->set_whitebal(s, 1);       // Auto white balance ON
-    s->set_awb_gain(s, 1);       // Auto white balance gain ON
-    s->set_exposure_ctrl(s, 1);  // Auto exposure ON
-    s->set_aec2(s, 1);           // Auto exposure control 2 ON
-    s->set_gain_ctrl(s, 1);      // Auto gain ON
-    s->set_agc_gain(s, 0);       // Auto gain value (0-30)
-    s->set_bpc(s, 1);            // Black pixel correction ON
-    s->set_wpc(s, 1);            // White pixel correction ON
-    s->set_lenc(s, 1);           // Lens correction ON
-    s->set_hmirror(s, 0);        // Horizontal mirror
-    s->set_vflip(s, 0);          // Vertical flip
-    s->set_colorbar(s, 0);       // Disable test pattern
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
+    s->set_saturation(s, 0);
+    s->set_whitebal(s, 1);
+    s->set_awb_gain(s, 1);
+    s->set_exposure_ctrl(s, 1);
+    s->set_aec2(s, 1);
+    s->set_gain_ctrl(s, 1);
+    s->set_agc_gain(s, 0);
+    s->set_bpc(s, 1);
+    s->set_wpc(s, 1);
+    s->set_lenc(s, 1);
+    s->set_hmirror(s, 0);
+    s->set_vflip(s, 0);
+    s->set_colorbar(s, 0);
     
     Serial.println("[CAMERA] Sensor optimized for performance");
   }
@@ -148,39 +144,29 @@ bool initCamera() {
 
 // ===== HTTP HANDLERS =====
 
-// MJPEG Stream handler - OPTIMIZED VERSION
 void handleStream() {
   Serial.println("[HTTP] Stream client connected");
 
   WiFiClient client = server.client();
+  client.setNoDelay(true);
   
-  // Configure client for low latency
-  client.setNoDelay(true);  // Disable Nagle's algorithm
-  
-  // Send HTTP headers
   client.println("HTTP/1.1 200 OK");
   client.printf("Content-Type: %s\r\n", _STREAM_CONTENT_TYPE);
   client.println("Access-Control-Allow-Origin: *");
   client.println("Cache-Control: no-cache, no-store, must-revalidate");
   client.println("Pragma: no-cache");
   client.println("Expires: 0");
-  // client.println("Connection: close");
   client.println("Connection: keep-alive");
   client.println();
 
-  // Reset FPS counter
   frameCount = 0;
   lastFpsTime = millis();
-
-  // Local buffer for content-length header (avoid String concatenation)
   char partHeader[64];
 
-  // Stream loop - OPTIMIZED
   unsigned long lastFrameTime = millis();
   unsigned long clientCheckTime = millis();
   
   while (client.connected()) {
-    //Check client alive every 10 seconds
     if (millis() - clientCheckTime >= 10000) {
       if (!client.available() && !client.connected()) {
         Serial.println("[HTTP] Client disconnected (timeout)");
@@ -189,39 +175,30 @@ void handleStream() {
       clientCheckTime = millis();
     }
 
-    // Get frame - LOCAL variable to prevent memory leak
     camera_fb_t* fb = esp_camera_fb_get();
 
     if (!fb) {
       Serial.println("[CAMERA] Frame capture failed!");
-      delay(10);  // Small delay before retry
+      vTaskDelay(10 / portTICK_PERIOD_MS);
       continue;
     }
 
-    // Validate frame
     if (fb->len == 0 || fb->buf == NULL) {
       Serial.println("[CAMERA] Invalid frame data!");
-      esp_camera_fb_return(fb);  // CRITICAL: return immediately
-      delay(10);
+      esp_camera_fb_return(fb);
+      vTaskDelay(10 / portTICK_PERIOD_MS);
       continue;
     }
 
-    // Calculate FPS
     frameCount++;
     unsigned long now = millis();
     if (now - lastFpsTime >= 1000) {
       currentFPS = frameCount * 1000.0 / (now - lastFpsTime);
-      Serial.printf("[FPS] %.1f fps | Frame: %dx%d | Size: %u KB | Heap: %u KB\n", 
-                    currentFPS, 
-                    fb->width, 
-                    fb->height,
-                    fb->len / 1024,
-                    ESP.getFreeHeap() / 1024);
+      Serial.printf("[FPS] %.1f fps | Size: %u KB\n", currentFPS, fb->len / 1024);
       frameCount = 0;
       lastFpsTime = now;
     }
 
-    // Send MJPEG boundary
     size_t boundaryLen = strlen(_STREAM_BOUNDARY);
     if (client.write(_STREAM_BOUNDARY, boundaryLen) != boundaryLen) {
       Serial.println("[HTTP] Failed to send boundary");
@@ -229,7 +206,6 @@ void handleStream() {
       break;
     }
 
-    // Send part header with content length
     size_t headerLen = snprintf(partHeader, sizeof(partHeader), _STREAM_PART, fb->len);
     if (client.write(partHeader, headerLen) != headerLen) {
       Serial.println("[HTTP] Failed to send part header");
@@ -237,81 +213,56 @@ void handleStream() {
       break;
     }
 
-    // Send JPEG data
     size_t sentBytes = client.write(fb->buf, fb->len);
     if (sentBytes != fb->len) {
-      Serial.printf("[HTTP] Failed to send frame data (%u/%u bytes)\n", sentBytes, fb->len);
+      Serial.println("[HTTP] Failed to send frame data");
       esp_camera_fb_return(fb);
       break;
     }
 
-    // CRITICAL: Return frame buffer IMMEDIATELY after sending
     esp_camera_fb_return(fb);
-    fb = NULL;  // Prevent double-free
-
+    fb = NULL;
     lastFrameTime = now;
 
-    // Yield to RTOS for other tasks (prevent watchdog timeout)
-    vTaskDelay(1 / portTICK_PERIOD_MS);
+    // Yield to RTOS to prevent watchdog timeout
+    vTaskDelay(10 / portTICK_PERIOD_MS);
   }
 
   Serial.println("[HTTP] Stream client disconnected");
 }
 
-// Single JPEG capture - OPTIMIZED
 void handleCapture() {
-  camera_fb_t* fb = esp_camera_fb_get();  // Local variable
+  camera_fb_t* fb = esp_camera_fb_get();
 
-  if (!fb) {
+  if (!fb || fb->len == 0 || fb->buf == NULL) {
+    if (fb) esp_camera_fb_return(fb);
     server.send(500, "text/plain", "Camera capture failed");
-    Serial.println("[HTTP] Capture failed - no frame");
-    return;
-  }
-
-  // Validate frame
-  if (fb->len == 0 || fb->buf == NULL) {
-    esp_camera_fb_return(fb);
-    server.send(500, "text/plain", "Invalid frame data");
-    Serial.println("[HTTP] Capture failed - invalid frame");
     return;
   }
 
   server.sendHeader("Content-Disposition", "inline; filename=capture.jpg");
   server.send_P(200, "image/jpeg", (const char*)fb->buf, fb->len);
 
-  esp_camera_fb_return(fb);  // CRITICAL: return frame buffer
-  fb = NULL;
-
+  esp_camera_fb_return(fb);
   Serial.println("[HTTP] Capture served");
 }
 
-// Status endpoint (JSON) - OPTIMIZED (avoid String concatenation)
 void handleStatus() {
-  // Use fixed buffer instead of String concatenation
   char json[256];
   snprintf(json, sizeof(json),
-           "{\"camera\":\"online\","
-           "\"wifi_rssi\":%d,"
-           "\"uptime\":%lu,"
-           "\"free_heap\":%u,"
-           "\"fps\":%.1f}",
-           WiFi.RSSI(),
-           millis() / 1000,
-           ESP.getFreeHeap(),
-           currentFPS);
+           "{\"camera\":\"online\",\"wifi_rssi\":%d,\"uptime\":%lu,\"free_heap\":%u,\"fps\":%.1f}",
+           WiFi.RSSI(), millis() / 1000, ESP.getFreeHeap(), currentFPS);
 
   server.send(200, "application/json", json);
-  Serial.println("[HTTP] Status served");
 }
 
-// Root page - Lightweight HTML
 void handleRoot() {
   const char* html = 
-    "<html><head><title>ESP32-CAM Fire Robot</title>"
+    "<html><head><title>ESP32-CAM Fire Robot (RTOS)</title>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
     "</head><body style='font-family:Arial;padding:20px;'>"
     "<h1>ESP32-CAM Stream Server</h1>"
-    "<h2>Fire Fighting Robot</h2>"
+    "<h2>Fire Fighting Robot (RTOS Edition)</h2>"
     "<p><a href='/stream'>MJPEG Stream</a></p>"
     "<p><a href='/capture'>Single Capture</a></p>"
     "<p><a href='/status'>Status JSON</a></p>"
@@ -327,15 +278,10 @@ void connectWiFi() {
   Serial.println("\n[WiFi] Connecting...");
   
   WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);  // Disable WiFi sleep for better performance
+  WiFi.setSleep(false);
   
-  // Try each configured network
   for (int i = 0; i < WIFI_NETWORK_COUNT; i++) {
-    Serial.print("[WiFi] Trying network ");
-    Serial.print(i + 1);
-    Serial.print(": ");
-    Serial.println(wifiCredentials[i][0]);
-    
+    Serial.printf("[WiFi] Trying network %d: %s\n", i + 1, wifiCredentials[i][0]);
     WiFi.begin(wifiCredentials[i][0], wifiCredentials[i][1]);
     
     int attempts = 0;
@@ -348,27 +294,50 @@ void connectWiFi() {
     if (WiFi.status() == WL_CONNECTED) {
       connectedNetworkIndex = i;
       Serial.println("\n[WiFi] ✓ Connected!");
-      Serial.print("[WiFi] Network: ");
-      Serial.println(wifiCredentials[i][0]);
       Serial.print("[WiFi] IP Address: ");
       Serial.println(WiFi.localIP());
-      Serial.print("[WiFi] Signal: ");
-      Serial.print(WiFi.RSSI());
-      Serial.println(" dBm");
-      
-      // Disable WiFi power save COMPLETELY for stable FPS
       esp_wifi_set_ps(WIFI_PS_NONE);
-      Serial.println("[WiFi] Power save DISABLED");
-      return;  // Success, exit function
-    } else {
-      Serial.println(" failed");
+      return;
     }
   }
   
-  // All networks failed
   Serial.println("\n[WiFi] ✗ All networks FAILED!");
-  Serial.println("[WiFi] Please check credentials in config.h");
-  connectedNetworkIndex = -1;
+}
+
+// ===== RTOS TASKS =====
+
+// Task 1: Xử lý Web Server (Chạy trên Core 0 - Chuyên Network)
+void serverTask(void *pvParameters) {
+  Serial.println("[RTOS] Server Task started on Core 0");
+  
+  // Vòng lặp vô hạn của Task
+  while (1) {
+    server.handleClient();  // Xử lý các HTTP request
+    
+    // Rất quan trọng: Phải có delay/yield để hệ điều hành chuyển đổi sang task khác
+    vTaskDelay(10 / portTICK_PERIOD_MS);
+  }
+}
+
+// Task 2: Điều khiển Robot Cứu Hỏa (Chạy trên Core 1 - Chuyên Application)
+void robotControlTask(void *pvParameters) {
+  Serial.println("[RTOS] Robot Control Task started on Core 1");
+  
+  // TODO: Khởi tạo các chân IO động cơ, cảm biến lửa ở đây
+  // pinMode(MOTOR_PIN, OUTPUT);
+  // pinMode(FLAME_SENSOR, INPUT);
+  
+  // Vòng lặp vô hạn của Task Robot
+  while (1) {
+    // TODO: Viết logic điều khiển robot ở đây
+    // Ví dụ: Đọc cảm biến lửa -> Điều khiển động cơ tới dập lửa
+    // Các lệnh trong này sẽ chạy liên tục, ĐỘC LẬP và KHÔNG BỊ GIẬT LAG khi có người vào xem Camera (Stream)
+    
+    // Mô phỏng logic đang chạy
+    // Serial.println("[ROBOT] Đang kiểm tra cảm biến...");
+    
+    vTaskDelay(50 / portTICK_PERIOD_MS); // Chạy 20 vòng/giây
+  }
 }
 
 // ===== SETUP =====
@@ -378,25 +347,15 @@ void setup() {
   delay(1000);
 
   Serial.println("\n\n===========================================");
-  Serial.println("  ESP32-CAM MJPEG STREAM SERVER");
+  Serial.println("  ESP32-CAM MJPEG STREAM SERVER (RTOS)");
   Serial.println("  Fire Fighting Robot - Camera Module");
-  Serial.println("  OPTIMIZED VERSION - No Memory Leaks");
   Serial.println("===========================================\n");
 
-  // PSRAM check
-  if (psramFound()) {
-    Serial.printf("[PSRAM] Found: %u bytes\n", ESP.getPsramSize());
-  } else {
-    Serial.println("[PSRAM] Not found - performance may be limited");
-  }
-
-  // Initialize camera
   if (!initCamera()) {
     Serial.println("[ERROR] Camera init failed! Halting.");
     while (1) delay(1000);
   }
 
-  // Connect WiFi
   connectWiFi();
 
   if (WiFi.status() != WL_CONNECTED) {
@@ -409,32 +368,46 @@ void setup() {
   server.on("/stream", handleStream);
   server.on("/capture", handleCapture);
   server.on("/status", handleStatus);
-
-  // Start server
   server.begin();
+
   Serial.println("\n[HTTP] Server started!");
+  
+  // ==========================================
+  // KHỞI TẠO FREERTOS TASKS
+  // ==========================================
+  
+  // 1. Tạo Server Task chạy ở Core 0
+  xTaskCreatePinnedToCore(
+    serverTask,         // Tên hàm thực thi
+    "ServerTask",       // Tên Task (dùng để debug)
+    4096,               // Kích thước bộ nhớ stack (bytes)
+    NULL,               // Tham số truyền vào (không có)
+    1,                  // Mức độ ưu tiên (Priority 1)
+    &serverTaskHandle,  // Con trỏ lưu Task Handle
+    0                   // Core 0
+  );
+
+  // 2. Tạo Robot Control Task chạy ở Core 1
+  xTaskCreatePinnedToCore(
+    robotControlTask,   // Tên hàm thực thi
+    "RobotTask",        // Tên Task (dùng để debug)
+    4096,               // Kích thước bộ nhớ stack (bytes)
+    NULL,               // Tham số truyền vào (không có)
+    1,                  // Mức độ ưu tiên (Priority 1)
+    &robotTaskHandle,   // Con trỏ lưu Task Handle
+    1                   // Core 1
+  );
+
   Serial.println("===========================================");
-  Serial.println("  Endpoints:");
-  Serial.print("  - Stream:  http://");
-  Serial.print(WiFi.localIP());
-  Serial.println("/stream");
-  Serial.print("  - Capture: http://");
-  Serial.print(WiFi.localIP());
-  Serial.println("/capture");
-  Serial.print("  - Status:  http://");
-  Serial.print(WiFi.localIP());
-  Serial.println("/status");
-  Serial.println("===========================================\n");
-  Serial.println("  SYSTEM READY!");
-  Serial.printf("  Free Heap: %u KB\n", ESP.getFreeHeap() / 1024);
+  Serial.println("  SYSTEM READY! RTOS Tasks are running.");
   Serial.println("===========================================\n");
 }
 
 // ===== MAIN LOOP =====
 
 void loop() {
-  server.handleClient();  // Handle HTTP requests
-  
-  // Small delay for RTOS task scheduling (prevent watchdog)
-  vTaskDelay(1 / portTICK_PERIOD_MS);
+  // Vì chúng ta đã sử dụng FreeRTOS Tasks trong hàm setup()
+  // Hàm loop() mặc định của Arduino (cũng là một Task) không còn cần thiết nữa.
+  // Xóa Task này để giải phóng bộ nhớ và tài nguyên cho ESP32.
+  vTaskDelete(NULL);
 }
